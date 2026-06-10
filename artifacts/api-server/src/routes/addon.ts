@@ -391,36 +391,43 @@ async function findItemIdByImdb(
   if (libraryIds.length === 0) return null;
 
   // Stremio always sends the tt-prefixed IMDb id. Jellyfin usually stores it
-  // with the tt prefix, but some libraries store the bare numeric form.
-  const variants = [`imdb.${imdbId}`];
-  if (imdbId.startsWith("tt")) variants.push(`imdb.${imdbId.slice(2)}`);
+  // with the tt prefix, but some libraries store the bare numeric form. Match
+  // both in a single query: AnyProviderIdEquals is comma-separated and matches
+  // ANY of the listed provider ids, so we no longer issue one request per
+  // variant.
+  const providerIds = [`imdb.${imdbId}`];
+  if (imdbId.startsWith("tt")) providerIds.push(`imdb.${imdbId.slice(2)}`);
+  const anyProviderIdEquals = providerIds.join(",");
 
-  for (const providerPair of variants) {
-    for (const parentId of libraryIds) {
-      const params = new URLSearchParams({
-        ParentId: parentId,
-        Recursive: "true",
-        IncludeItemTypes: itemType,
-        AnyProviderIdEquals: providerPair,
-        Limit: "1",
+  // Query each enabled library concurrently and take the first match, instead
+  // of fanning out sequentially. This keeps library-toggle scoping intact
+  // (we still only search the libraries the user exposed) while collapsing the
+  // latency to a single round-trip.
+  const lookups = libraryIds.map(async (parentId) => {
+    const params = new URLSearchParams({
+      ParentId: parentId,
+      Recursive: "true",
+      IncludeItemTypes: itemType,
+      AnyProviderIdEquals: anyProviderIdEquals,
+      Limit: "1",
+    });
+
+    try {
+      const resp = await fetch(`${baseUrl}/Users/${config.userId}/Items?${params}`, {
+        headers: jellyfinHeaders(config.accessToken),
       });
+      if (!resp.ok) return null;
 
-      try {
-        const resp = await fetch(`${baseUrl}/Users/${config.userId}/Items?${params}`, {
-          headers: jellyfinHeaders(config.accessToken),
-        });
-        if (!resp.ok) continue;
-
-        const data = (await resp.json()) as { Items?: Array<{ Id: string }> };
-        const item = data?.Items?.[0];
-        if (item?.Id) return item.Id;
-      } catch (err) {
-        logger.error({ err }, "findItemIdByImdb error");
-      }
+      const data = (await resp.json()) as { Items?: Array<{ Id: string }> };
+      return data?.Items?.[0]?.Id ?? null;
+    } catch (err) {
+      logger.error({ err }, "findItemIdByImdb error");
+      return null;
     }
-  }
+  });
 
-  return null;
+  const results = await Promise.all(lookups);
+  return results.find((id): id is string => Boolean(id)) ?? null;
 }
 
 async function findEpisodeId(
