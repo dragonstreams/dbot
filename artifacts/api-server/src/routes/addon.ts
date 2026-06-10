@@ -379,6 +379,33 @@ async function buildStreams(
   return streams;
 }
 
+const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
+
+function normalizeImdb(id: string): string {
+  return id.replace(/^tt/i, "");
+}
+
+// Translate a Cinemeta IMDb id to a human title + release year. Stremio only
+// hands the addon the IMDb id, so this is how we learn what to search Jellyfin
+// for. Returns null if Cinemeta has no entry or is unreachable.
+async function imdbToTitle(
+  type: "movie" | "series",
+  imdbId: string
+): Promise<{ name: string; year: number | null } | null> {
+  try {
+    const resp = await fetch(`${CINEMETA_BASE}/meta/${type}/${imdbId}.json`);
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as { meta?: { name?: string; year?: string } };
+    const name = data?.meta?.name;
+    if (!name) return null;
+    const yearMatch = data?.meta?.year?.match(/\d{4}/);
+    return { name, year: yearMatch ? parseInt(yearMatch[0], 10) : null };
+  } catch (err) {
+    logger.error({ err }, "imdbToTitle (Cinemeta) error");
+    return null;
+  }
+}
+
 async function findItemIdByImdb(
   baseUrl: string,
   config: AddonConfig,
@@ -390,44 +417,71 @@ async function findItemIdByImdb(
   // libraries they exposed. No enabled libraries of this type -> no match.
   if (libraryIds.length === 0) return null;
 
-  // Stremio always sends the tt-prefixed IMDb id. Jellyfin usually stores it
-  // with the tt prefix, but some libraries store the bare numeric form. Match
-  // both in a single query: AnyProviderIdEquals is comma-separated and matches
-  // ANY of the listed provider ids, so we no longer issue one request per
-  // variant.
-  const providerIds = [`imdb.${imdbId}`];
-  if (imdbId.startsWith("tt")) providerIds.push(`imdb.${imdbId.slice(2)}`);
-  const anyProviderIdEquals = providerIds.join(",");
+  // Jellyfin's `AnyProviderIdEquals` filter is silently ignored on modern
+  // servers (10.11.x returns arbitrary items as if the filter weren't there),
+  // so provider-id resolution cannot be done server-side. Instead translate the
+  // IMDb id to a title via Cinemeta, search each enabled library by that title,
+  // and confirm the match by the item's stored IMDb provider id.
+  const stremioType = itemType === "Series" ? "series" : "movie";
+  const meta = await imdbToTitle(stremioType, imdbId);
+  if (!meta) return null;
 
-  // Query each enabled library concurrently and take the first match, instead
-  // of fanning out sequentially. This keeps library-toggle scoping intact
-  // (we still only search the libraries the user exposed) while collapsing the
-  // latency to a single round-trip.
+  const wantedImdb = normalizeImdb(imdbId);
+
+  // Search each enabled library concurrently (keeps library-toggle scoping
+  // intact) and gather all candidates before deciding.
   const lookups = libraryIds.map(async (parentId) => {
     const params = new URLSearchParams({
       ParentId: parentId,
       Recursive: "true",
       IncludeItemTypes: itemType,
-      AnyProviderIdEquals: anyProviderIdEquals,
-      Limit: "1",
+      SearchTerm: meta.name,
+      Fields: "ProviderIds,ProductionYear",
+      Limit: "25",
     });
 
     try {
       const resp = await fetch(`${baseUrl}/Users/${config.userId}/Items?${params}`, {
         headers: jellyfinHeaders(config.accessToken),
       });
-      if (!resp.ok) return null;
+      if (!resp.ok) return [];
 
-      const data = (await resp.json()) as { Items?: Array<{ Id: string }> };
-      return data?.Items?.[0]?.Id ?? null;
+      const data = (await resp.json()) as {
+        Items?: Array<{
+          Id: string;
+          ProductionYear?: number;
+          ProviderIds?: Record<string, string>;
+        }>;
+      };
+      return data?.Items ?? [];
     } catch (err) {
-      logger.error({ err }, "findItemIdByImdb error");
-      return null;
+      logger.error({ err }, "findItemIdByImdb search error");
+      return [];
     }
   });
 
-  const results = await Promise.all(lookups);
-  return results.find((id): id is string => Boolean(id)) ?? null;
+  const candidates = (await Promise.all(lookups)).flat();
+  if (candidates.length === 0) return null;
+
+  // 1) An exact IMDb provider-id match is authoritative.
+  const exact = candidates.find((c) => {
+    const cImdb = c.ProviderIds?.Imdb ?? c.ProviderIds?.imdb;
+    return cImdb && normalizeImdb(cImdb) === wantedImdb;
+  });
+  if (exact) return exact.Id;
+
+  // 2) Fall back to a release-year match. Avoids picking the wrong entry from a
+  // franchise (e.g. "The Matrix" vs "The Matrix Reloaded") when an item has no
+  // stored IMDb id.
+  if (meta.year !== null) {
+    const byYear = candidates.find((c) => c.ProductionYear === meta.year);
+    if (byYear) return byYear.Id;
+  }
+
+  // 3) A single, unambiguous title result is trustworthy on its own.
+  if (candidates.length === 1) return candidates[0].Id;
+
+  return null;
 }
 
 async function findEpisodeId(
