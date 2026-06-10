@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: jellyfin
+    description: Jellyfin server operations
 paths:
   /healthz:
     get:
@@ -24,6 +26,81 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /jellyfin/auth:
+    post:
+      operationId: jellyfinAuth
+      tags: [jellyfin]
+      summary: Authenticate with a Jellyfin server
+      description: Authenticates with the provided Jellyfin server and returns user credentials
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JellyfinAuthInput"
+      responses:
+        "200":
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JellyfinCredentials"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "502":
+          description: Could not reach Jellyfin server
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /jellyfin/libraries:
+    get:
+      operationId: getJellyfinLibraries
+      tags: [jellyfin]
+      summary: Get Jellyfin libraries
+      description: Returns the list of media libraries from the Jellyfin server
+      parameters:
+        - name: serverUrl
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: accessToken
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Libraries retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JellyfinLibraryList"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "502":
+          description: Could not reach Jellyfin server
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +111,70 @@ components:
       required:
         - status
 
+    JellyfinAuthInput:
+      type: object
+      properties:
+        serverUrl:
+          type: string
+          description: Full URL of the Jellyfin server (e.g. https://jellyfin.example.com)
+        username:
+          type: string
+        password:
+          type: string
+      required:
+        - serverUrl
+        - username
+        - password
+
+    JellyfinCredentials:
+      type: object
+      properties:
+        userId:
+          type: string
+        accessToken:
+          type: string
+        serverUrl:
+          type: string
+        username:
+          type: string
+      required:
+        - userId
+        - accessToken
+        - serverUrl
+        - username
+
+    JellyfinLibrary:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        collectionType:
+          type: string
+          description: "Jellyfin collection type: movies, tvshows, music, etc."
+      required:
+        - id
+        - name
+        - collectionType
+
+    JellyfinLibraryList:
+      type: object
+      properties:
+        libraries:
+          type: array
+          items:
+            $ref: "#/components/schemas/JellyfinLibrary"
+      required:
+        - libraries
+
+    ApiError:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+      required:
+        - error
+        - message

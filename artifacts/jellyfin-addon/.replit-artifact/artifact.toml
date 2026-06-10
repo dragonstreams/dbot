@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Jellyfin Stremio Addon"
+version = "1.0.0"
+id = "artifacts/jellyfin-addon"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25714
+
+[services.development]
+run = "pnpm --filter @workspace/jellyfin-addon run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/jellyfin-addon", "run", "build" ]
+publicDir = "artifacts/jellyfin-addon/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25714"
+BASE_PATH = "/"
