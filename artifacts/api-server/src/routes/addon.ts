@@ -70,7 +70,7 @@ router.get("/:config/manifest.json", (req, res) => {
     catalogs,
     resources: ["catalog", "stream", "meta"],
     types,
-    idPrefixes: ["jellyfin:"],
+    idPrefixes: ["jellyfin:", "tt"],
     behaviorHints: {
       configurable: false,
       configurationRequired: false,
@@ -294,51 +294,30 @@ router.get("/:config/meta/:type/:id.json", async (req, res) => {
   }
 });
 
-router.get("/:config/stream/:type/:id.json", async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-
-  const config = decodeConfig(req.params.config);
-  if (!config) {
-    res.status(400).json({ error: "Invalid config" });
-    return;
-  }
-
-  const { id } = req.params;
-  if (!id.startsWith("jellyfin:")) {
-    res.json({ streams: [] });
-    return;
-  }
-
-  const itemId = id.replace("jellyfin:", "");
-  const baseUrl = config.serverUrl;
+async function buildStreams(
+  baseUrl: string,
+  config: AddonConfig,
+  itemId: string
+): Promise<Array<Record<string, unknown>>> {
+  const streams: Array<Record<string, unknown>> = [];
 
   try {
-    const infoResp = await fetch(
-      `${baseUrl}/Items/${itemId}/PlaybackInfo`,
-      {
-        method: "POST",
-        headers: jellyfinHeaders(config.accessToken),
-        body: JSON.stringify({
-          UserId: config.userId,
-          DeviceProfile: {
-            MaxStaticBitrate: 140000000,
-            MaxStreamingBitrate: 140000000,
-            DirectPlayProfiles: [
-              { Type: "Video" },
-              { Type: "Audio" },
-              { Type: "Photo" },
-            ],
-            TranscodingProfiles: [],
-            ContainerProfiles: [],
-            CodecProfiles: [],
-            SubtitleProfiles: [],
-          },
-        }),
-      }
-    );
-
-    const streams: Array<Record<string, unknown>> = [];
+    const infoResp = await fetch(`${baseUrl}/Items/${itemId}/PlaybackInfo`, {
+      method: "POST",
+      headers: jellyfinHeaders(config.accessToken),
+      body: JSON.stringify({
+        UserId: config.userId,
+        DeviceProfile: {
+          MaxStaticBitrate: 140000000,
+          MaxStreamingBitrate: 140000000,
+          DirectPlayProfiles: [{ Type: "Video" }, { Type: "Audio" }, { Type: "Photo" }],
+          TranscodingProfiles: [],
+          ContainerProfiles: [],
+          CodecProfiles: [],
+          SubtitleProfiles: [],
+        },
+      }),
+    });
 
     if (infoResp.ok) {
       const playbackInfo = (await infoResp.json()) as {
@@ -365,15 +344,12 @@ router.get("/:config/stream/:type/:id.json", async (req, res) => {
         const directUrl = `${baseUrl}/Videos/${itemId}/stream?static=true&mediaSourceId=${source.Id}&api_key=${config.accessToken}`;
 
         const videoStream = source.MediaStreams?.find((s) => s.Type === "Video");
-        const resolution = videoStream?.Width && videoStream?.Height
-          ? `${videoStream.Width}x${videoStream.Height}`
-          : null;
+        const resolution =
+          videoStream?.Width && videoStream?.Height
+            ? `${videoStream.Width}x${videoStream.Height}`
+            : null;
 
-        const title = [
-          "Direct Play",
-          source.Container?.toUpperCase(),
-          resolution,
-        ]
+        const title = ["Direct Play", source.Container?.toUpperCase(), resolution]
           .filter(Boolean)
           .join(" · ");
 
@@ -388,16 +364,146 @@ router.get("/:config/stream/:type/:id.json", async (req, res) => {
         });
       }
     }
+  } catch (err) {
+    logger.error({ err }, "buildStreams error");
+  }
 
-    if (streams.length === 0) {
-      const fallbackUrl = `${baseUrl}/Videos/${itemId}/stream?static=true&api_key=${config.accessToken}`;
-      streams.push({
-        url: fallbackUrl,
-        title: "Direct Play",
-        name: "Jellyfin",
+  if (streams.length === 0) {
+    streams.push({
+      url: `${baseUrl}/Videos/${itemId}/stream?static=true&api_key=${config.accessToken}`,
+      title: "Direct Play",
+      name: "Jellyfin",
+    });
+  }
+
+  return streams;
+}
+
+async function findItemIdByImdb(
+  baseUrl: string,
+  config: AddonConfig,
+  imdbId: string,
+  itemType: "Movie" | "Series",
+  libraryIds: string[]
+): Promise<string | null> {
+  // Respect the user's enabled-library toggles: only search within the
+  // libraries they exposed. No enabled libraries of this type -> no match.
+  if (libraryIds.length === 0) return null;
+
+  // Stremio always sends the tt-prefixed IMDb id. Jellyfin usually stores it
+  // with the tt prefix, but some libraries store the bare numeric form.
+  const variants = [`imdb.${imdbId}`];
+  if (imdbId.startsWith("tt")) variants.push(`imdb.${imdbId.slice(2)}`);
+
+  for (const providerPair of variants) {
+    for (const parentId of libraryIds) {
+      const params = new URLSearchParams({
+        ParentId: parentId,
+        Recursive: "true",
+        IncludeItemTypes: itemType,
+        AnyProviderIdEquals: providerPair,
+        Limit: "1",
       });
+
+      try {
+        const resp = await fetch(`${baseUrl}/Users/${config.userId}/Items?${params}`, {
+          headers: jellyfinHeaders(config.accessToken),
+        });
+        if (!resp.ok) continue;
+
+        const data = (await resp.json()) as { Items?: Array<{ Id: string }> };
+        const item = data?.Items?.[0];
+        if (item?.Id) return item.Id;
+      } catch (err) {
+        logger.error({ err }, "findItemIdByImdb error");
+      }
+    }
+  }
+
+  return null;
+}
+
+async function findEpisodeId(
+  baseUrl: string,
+  config: AddonConfig,
+  seriesItemId: string,
+  season: number,
+  episode: number
+): Promise<string | null> {
+  const params = new URLSearchParams({
+    userId: config.userId,
+    season: String(season),
+  });
+
+  try {
+    const resp = await fetch(`${baseUrl}/Shows/${seriesItemId}/Episodes?${params}`, {
+      headers: jellyfinHeaders(config.accessToken),
+    });
+    if (!resp.ok) return null;
+
+    const data = (await resp.json()) as {
+      Items?: Array<{ Id: string; IndexNumber?: number; ParentIndexNumber?: number }>;
+    };
+
+    const ep = data?.Items?.find(
+      (e) => e.IndexNumber === episode && e.ParentIndexNumber === season
+    );
+    return ep?.Id ?? null;
+  } catch (err) {
+    logger.error({ err }, "findEpisodeId error");
+    return null;
+  }
+}
+
+router.get("/:config/stream/:type/:id.json", async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+
+  const config = decodeConfig(req.params.config);
+  if (!config) {
+    res.status(400).json({ error: "Invalid config" });
+    return;
+  }
+
+  const { type, id } = req.params;
+  const baseUrl = config.serverUrl;
+
+  try {
+    let itemId: string | null = null;
+
+    if (id.startsWith("jellyfin:")) {
+      // The addon's own catalog items map directly to Jellyfin item ids.
+      itemId = id.replace("jellyfin:", "");
+    } else if (id.startsWith("tt")) {
+      // Cinemeta IMDb ids. Movie: ttXXXXXXX. Series: ttXXXXXXX:season:episode
+      const parts = id.split(":");
+      const imdbId = parts[0];
+
+      const movieLibIds = config.enabledLibraries
+        .filter((l) => l.collectionType === "movies")
+        .map((l) => l.id);
+      const seriesLibIds = config.enabledLibraries
+        .filter((l) => l.collectionType === "tvshows")
+        .map((l) => l.id);
+
+      if (type === "series" && parts.length >= 3) {
+        const season = parseInt(parts[1], 10);
+        const episode = parseInt(parts[2], 10);
+        const seriesId = await findItemIdByImdb(baseUrl, config, imdbId, "Series", seriesLibIds);
+        if (seriesId && Number.isFinite(season) && Number.isFinite(episode)) {
+          itemId = await findEpisodeId(baseUrl, config, seriesId, season, episode);
+        }
+      } else {
+        itemId = await findItemIdByImdb(baseUrl, config, imdbId, "Movie", movieLibIds);
+      }
     }
 
+    if (!itemId) {
+      res.json({ streams: [] });
+      return;
+    }
+
+    const streams = await buildStreams(baseUrl, config, itemId);
     res.json({ streams });
   } catch (err) {
     logger.error({ err }, "Stream fetch error");

@@ -1,0 +1,1 @@
+- [Stremio addon Cinemeta integration](stremio-cinemeta-integration.md) — how the addon attaches Jellyfin streams to Stremio's default IMDb catalog
