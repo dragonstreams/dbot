@@ -32,6 +32,10 @@ function collectionTypeToStremio(collectionType: string): "movie" | "series" | n
   return null;
 }
 
+router.get("/healthz", (_req, res) => {
+  res.json({ status: "ok" });
+});
+
 router.get("/:config/manifest.json", (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) {
