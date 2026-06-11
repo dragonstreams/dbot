@@ -294,6 +294,36 @@ router.get("/:config/meta/:type/:id.json", async (req, res) => {
   }
 });
 
+function formatSize(bytes: number): string {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
+  return `${bytes} B`;
+}
+
+function resolutionLabel(width?: number, height?: number): string | null {
+  if (!height) return null;
+  if (height >= 2160 || (width && width >= 3840)) return "4K";
+  if (height >= 1080) return "1080p";
+  if (height >= 720) return "720p";
+  if (height >= 480) return "480p";
+  return `${height}p`;
+}
+
+function audioLabel(codec?: string, channels?: number): string | null {
+  if (!codec) return null;
+  const name = codec.toUpperCase();
+  if (!channels) return name;
+  const layout =
+    channels === 8 ? "7.1" :
+    channels === 7 ? "6.1" :
+    channels === 6 ? "5.1" :
+    channels === 3 ? "2.1" :
+    channels === 2 ? "Stereo" :
+    channels === 1 ? "Mono" :
+    `${channels}ch`;
+  return `${name} ${layout}`;
+}
+
 async function buildStreams(
   baseUrl: string,
   config: AddonConfig,
@@ -336,6 +366,7 @@ async function buildStreams(
             DisplayTitle?: string;
             Width?: number;
             Height?: number;
+            Channels?: number;
           }>;
         }>;
       };
@@ -344,14 +375,15 @@ async function buildStreams(
         const directUrl = `${baseUrl}/Videos/${itemId}/stream?static=true&mediaSourceId=${source.Id}&api_key=${config.accessToken}`;
 
         const videoStream = source.MediaStreams?.find((s) => s.Type === "Video");
-        const resolution =
-          videoStream?.Width && videoStream?.Height
-            ? `${videoStream.Width}x${videoStream.Height}`
-            : null;
+        const audioStream = source.MediaStreams?.find((s) => s.Type === "Audio");
 
-        const title = ["Direct Play", source.Container?.toUpperCase(), resolution]
-          .filter(Boolean)
-          .join(" · ");
+        const resolution = resolutionLabel(videoStream?.Width, videoStream?.Height);
+        const audio = audioLabel(audioStream?.Codec, audioStream?.Channels);
+        const size = source.Size ? formatSize(source.Size) : null;
+        const container = source.Container?.toUpperCase();
+
+        const details = [resolution, audio, size].filter(Boolean).join(" · ");
+        const title = `${container ?? "Direct Play"}${details ? `\n${details}` : ""}`;
 
         streams.push({
           url: directUrl,
