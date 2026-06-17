@@ -8,6 +8,7 @@ interface AddonConfig {
   userId: string;
   accessToken: string;
   enabledLibraries: Array<{ id: string; name: string; collectionType: string }>;
+  maxStreams?: number; // 0 or absent = unlimited
 }
 
 function decodeConfig(raw: string): AddonConfig | null {
@@ -552,6 +553,28 @@ async function findEpisodeId(
   }
 }
 
+async function countActiveStreams(baseUrl: string, config: AddonConfig): Promise<number> {
+  try {
+    const resp = await fetch(
+      `${baseUrl}/Sessions?ControllableByUserId=${config.userId}&ActiveWithinSeconds=300`,
+      { headers: jellyfinHeaders(config.accessToken) }
+    );
+    if (!resp.ok) return 0;
+
+    const sessions = (await resp.json()) as Array<{
+      UserId?: string;
+      NowPlayingItem?: unknown;
+    }>;
+
+    return sessions.filter(
+      (s) => s.UserId === config.userId && s.NowPlayingItem != null
+    ).length;
+  } catch (err) {
+    logger.error({ err }, "countActiveStreams error");
+    return 0;
+  }
+}
+
 router.get("/:config/stream/:type/:id.json", async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -564,6 +587,24 @@ router.get("/:config/stream/:type/:id.json", async (req, res) => {
 
   const { type, id } = req.params;
   const baseUrl = config.serverUrl;
+
+  // Enforce simultaneous stream limit (StreamLimiter-compatible check)
+  if (config.maxStreams && config.maxStreams > 0) {
+    const active = await countActiveStreams(baseUrl, config);
+    if (active >= config.maxStreams) {
+      res.json({
+        streams: [
+          {
+            name: "Jellyfin",
+            title: `⚠️ Stream limit reached\n${active}/${config.maxStreams} streams active`,
+            url: "https://localhost",
+            behaviorHints: { notWebReady: true },
+          },
+        ],
+      });
+      return;
+    }
+  }
 
   try {
     let itemId: string | null = null;

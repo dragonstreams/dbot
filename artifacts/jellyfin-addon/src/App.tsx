@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
-import { Server, User, KeyRound, Copy, Check, Tv, Film, ChevronRight, Loader2, RefreshCw } from "lucide-react";
+import { Server, User, KeyRound, Copy, Check, Tv, Film, ChevronRight, Loader2, RefreshCw, Gauge } from "lucide-react";
 
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -39,6 +39,7 @@ function ConfigWizard() {
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [credentials, setCredentials] = useState<JellyfinCredentials | null>(null);
   const [selectedLibraryIds, setSelectedLibraryIds] = useState<Set<string>>(new Set());
+  const [maxStreams, setMaxStreams] = useState<number>(0);
   const [manifestUrl, setManifestUrl] = useState<string>("");
   const [isCopied, setIsCopied] = useState(false);
 
@@ -121,12 +122,16 @@ function ConfigWizard() {
 
     const enabledLibraries = libraries.filter(l => selectedLibraryIds.has(l.id));
     
-    const config = {
+    const config: Record<string, unknown> = {
       serverUrl: credentials.serverUrl,
       userId: credentials.userId,
       accessToken: credentials.accessToken,
-      enabledLibraries
+      enabledLibraries,
     };
+
+    if (maxStreams > 0) {
+      config.maxStreams = maxStreams;
+    }
 
     const encoded = btoa(JSON.stringify(config))
       .replace(/\+/g, '-')
@@ -152,6 +157,7 @@ function ConfigWizard() {
     setStep(1);
     setCredentials(null);
     setSelectedLibraryIds(new Set());
+    setMaxStreams(0);
     setManifestUrl("");
     authForm.reset();
   }
@@ -325,6 +331,43 @@ function ConfigWizard() {
                   />
                 </div>
               ))}
+
+              {/* Stream limit setting */}
+              <div className="border-t border-border pt-4 mt-2 space-y-3">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-md bg-primary/10 text-primary">
+                    <Gauge className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <p className="font-medium text-sm">Stream limit</p>
+                    <p className="text-xs text-muted-foreground">Max simultaneous streams for this user</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  <Input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={maxStreams === 0 ? "" : maxStreams}
+                    placeholder="Unlimited"
+                    className="w-32 bg-background/50 border-muted font-mono text-sm"
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      setMaxStreams(Number.isFinite(val) && val > 0 ? val : 0);
+                    }}
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    {maxStreams > 0
+                      ? `Block new streams when ${maxStreams} ${maxStreams === 1 ? "stream is" : "streams are"} active`
+                      : "No limit enforced"}
+                  </span>
+                </div>
+                {maxStreams > 0 && (
+                  <p className="text-xs text-muted-foreground bg-muted/40 rounded-md px-3 py-2">
+                    Requires the <strong>StreamLimiter</strong> plugin on your Jellyfin server. Active session counts are read via the Jellyfin Sessions API.
+                  </p>
+                )}
+              </div>
 
             </CardContent>
             <CardFooter className="flex justify-between border-t border-border pt-4">
