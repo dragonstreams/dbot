@@ -5,8 +5,15 @@ import {
   StringSelectMenuOptionBuilder,
   ActionRowBuilder,
   EmbedBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   ComponentType,
+  type ButtonInteraction,
   type StringSelectMenuInteraction,
+  type ModalSubmitInteraction,
 } from "discord.js";
 import {
   getSession,
@@ -17,24 +24,374 @@ import {
 } from "./store.js";
 import { jellyfinAuth, jellyfinLibraries, getManifestUrl } from "./api.js";
 
-const JELLYFIN_ICON = "https://jellyfin.org/images/logo.svg";
+const COLOR_BRAND = 0x00a4dc; // Jellyfin blue
+const COLOR_SUCCESS = 0x2ecc71;
+const COLOR_ERROR = 0xe74c3c;
+const COLOR_NEUTRAL = 0x95a5a6;
 
-function errorEmbed(message: string): EmbedBuilder {
-  return new EmbedBuilder().setColor(0xe74c3c).setDescription(`❌ ${message}`);
+function errorEmbed(msg: string): EmbedBuilder {
+  return new EmbedBuilder().setColor(COLOR_ERROR).setDescription(`❌ ${msg}`);
 }
 
-function successEmbed(title: string, description?: string): EmbedBuilder {
-  const e = new EmbedBuilder().setColor(0x2ecc71).setTitle(title);
-  if (description) e.setDescription(description);
-  return e;
+async function showLibraryStep(
+  i: ButtonInteraction | ModalSubmitInteraction,
+  discordUserId: string,
+  edit: boolean
+): Promise<void> {
+  const session = getSession(discordUserId);
+  if (!session) return;
+
+  const enabledIds = new Set(session.enabledLibraries.map((l) => l.id));
+
+  const options = session.allLibraries.map((lib) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(lib.name)
+      .setValue(lib.id)
+      .setDescription(lib.collectionType === "movies" ? "Movies" : "TV Shows")
+      .setEmoji(lib.collectionType === "movies" ? "🎬" : "📺")
+      .setDefault(enabledIds.has(lib.id))
+  );
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId("lib_select")
+    .setPlaceholder("Pick libraries to include in Stremio…")
+    .setMinValues(0)
+    .setMaxValues(session.allLibraries.length)
+    .addOptions(options);
+
+  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR_BRAND)
+    .setTitle("📚 Step 2 — Select Libraries")
+    .setDescription(
+      `Connected as **${session.username}** on \`${session.serverUrl}\`\n\n` +
+        `Toggle which libraries should appear in Stremio, then click **Done** to get your manifest URL.`
+    );
+
+  const payload = { embeds: [embed], components: [row] };
+  const reply = edit
+    ? await (i as ButtonInteraction).update(payload)
+    : await i.reply({ ...payload, fetchReply: true, ephemeral: true });
+
+  const msg = edit ? await (i as ButtonInteraction).fetchReply() : reply;
+
+  try {
+    const sel = (await msg.awaitMessageComponent({
+      componentType: ComponentType.StringSelect,
+      time: 120_000,
+    })) as StringSelectMenuInteraction;
+
+    const chosen: Library[] = session.allLibraries.filter((l) =>
+      sel.values.includes(l.id)
+    );
+    updateEnabledLibraries(discordUserId, chosen);
+
+    await showManifestStep(sel, discordUserId);
+  } catch {
+    await i.editReply({
+      embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("⏱️ Timed out — run `/jellyfin` again to continue.")],
+      components: [],
+    });
+  }
 }
 
-async function handleConnect(i: ChatInputCommandInteraction): Promise<void> {
-  await i.deferReply({ ephemeral: true });
+async function showManifestStep(
+  i: StringSelectMenuInteraction,
+  discordUserId: string
+): Promise<void> {
+  const session = getSession(discordUserId);
+  if (!session) return;
 
-  const serverUrl = i.options.getString("server_url", true).replace(/\/$/, "");
-  const username = i.options.getString("username", true);
-  const password = i.options.getString("password", true);
+  if (session.enabledLibraries.length === 0) {
+    const noLibRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("back_to_libs")
+        .setLabel("← Back to Libraries")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("disconnect_btn")
+        .setLabel("Disconnect")
+        .setStyle(ButtonStyle.Danger)
+    );
+    const msg = await i.update({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR_NEUTRAL)
+          .setTitle("No Libraries Selected")
+          .setDescription("Select at least one library to generate a manifest URL."),
+      ],
+      components: [noLibRow],
+    });
+    try {
+      const btn = (await msg.awaitMessageComponent({
+        componentType: ComponentType.Button,
+        time: 120_000,
+      })) as ButtonInteraction;
+      if (btn.customId === "back_to_libs") {
+        await showLibraryStep(btn, discordUserId, true);
+      } else {
+        deleteSession(discordUserId);
+        await btn.update({
+          embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("Session cleared.")],
+          components: [],
+        });
+      }
+    } catch { /* timed out */ }
+    return;
+  }
+
+  let url: string;
+  try {
+    url = getManifestUrl({
+      serverUrl: session.serverUrl,
+      userId: session.userId,
+      accessToken: session.accessToken,
+      enabledLibraries: session.enabledLibraries,
+    });
+  } catch (err) {
+    await i.update({
+      embeds: [errorEmbed(err instanceof Error ? err.message : "Could not generate URL")],
+      components: [],
+    });
+    return;
+  }
+
+  const libNames = session.enabledLibraries.map((l) =>
+    `${l.collectionType === "movies" ? "🎬" : "📺"} ${l.name}`
+  ).join("\n");
+
+  const doneRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("back_to_libs")
+      .setLabel("← Change Libraries")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("disconnect_btn")
+      .setLabel("Disconnect")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  const msg = await i.update({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR_SUCCESS)
+        .setTitle("✅ Step 3 — Your Stremio Manifest URL")
+        .setDescription(
+          `**Paste this into Stremio:**\n\`\`\`\n${url}\n\`\`\`\n` +
+            `**Libraries included:**\n${libNames}\n\n` +
+            `In Stremio: **Addons → Community Addons → Install from URL**`
+        )
+        .setFooter({ text: "Keep this URL private — it contains your Jellyfin access token." }),
+    ],
+    components: [doneRow],
+  });
+
+  try {
+    const btn = (await msg.awaitMessageComponent({
+      componentType: ComponentType.Button,
+      time: 300_000,
+    })) as ButtonInteraction;
+
+    if (btn.customId === "back_to_libs") {
+      await showLibraryStep(btn, discordUserId, true);
+    } else {
+      deleteSession(discordUserId);
+      await btn.update({
+        embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("Session cleared. Run `/jellyfin` to start again.")],
+        components: [],
+      });
+    }
+  } catch { /* timed out */ }
+}
+
+export const commandDefinitions = [
+  new SlashCommandBuilder()
+    .setName("jellyfin")
+    .setDescription("Set up your Jellyfin Stremio addon"),
+];
+
+export async function handleCommand(i: ChatInputCommandInteraction): Promise<void> {
+  if (i.commandName !== "jellyfin") return;
+
+  const session = getSession(i.user.id);
+
+  if (session) {
+    // Already connected — show status with action buttons
+    const libNames =
+      session.enabledLibraries.length > 0
+        ? session.enabledLibraries.map((l) => `${l.collectionType === "movies" ? "🎬" : "📺"} ${l.name}`).join("\n")
+        : "_None selected yet_";
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("go_to_libs")
+        .setLabel("Manage Libraries")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("go_to_manifest")
+        .setLabel("Get Manifest URL")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId("disconnect_btn")
+        .setLabel("Disconnect")
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    const reply = await i.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR_BRAND)
+          .setTitle("📡 Already Connected")
+          .addFields(
+            { name: "Server", value: `\`${session.serverUrl}\``, inline: false },
+            { name: "Username", value: session.username, inline: true },
+            { name: "Enabled Libraries", value: libNames, inline: false }
+          ),
+      ],
+      components: [row],
+      ephemeral: true,
+      fetchReply: true,
+    });
+
+    try {
+      const btn = (await reply.awaitMessageComponent({
+        componentType: ComponentType.Button,
+        time: 120_000,
+      })) as ButtonInteraction;
+
+      if (btn.customId === "go_to_libs") {
+        await showLibraryStep(btn, i.user.id, true);
+      } else if (btn.customId === "go_to_manifest") {
+        if (session.enabledLibraries.length === 0) {
+          await showLibraryStep(btn, i.user.id, true);
+        } else {
+          let url: string;
+          try {
+            url = getManifestUrl({
+              serverUrl: session.serverUrl,
+              userId: session.userId,
+              accessToken: session.accessToken,
+              enabledLibraries: session.enabledLibraries,
+            });
+          } catch (err) {
+            await btn.update({
+              embeds: [errorEmbed(err instanceof Error ? err.message : "Could not generate URL")],
+              components: [],
+            });
+            return;
+          }
+          const libNamesForManifest = session.enabledLibraries
+            .map((l) => `${l.collectionType === "movies" ? "🎬" : "📺"} ${l.name}`)
+            .join("\n");
+          await btn.update({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(COLOR_SUCCESS)
+                .setTitle("✅ Your Stremio Manifest URL")
+                .setDescription(
+                  `**Paste this into Stremio:**\n\`\`\`\n${url}\n\`\`\`\n**Libraries included:**\n${libNamesForManifest}\n\nIn Stremio: **Addons → Community Addons → Install from URL**`
+                )
+                .setFooter({ text: "Keep this URL private — it contains your Jellyfin access token." }),
+            ],
+            components: [],
+          });
+        }
+      } else {
+        deleteSession(i.user.id);
+        await btn.update({
+          embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("Session cleared. Run `/jellyfin` to start again.")],
+          components: [],
+        });
+      }
+    } catch { /* timed out */ }
+
+    return;
+  }
+
+  // Not connected — show welcome + connect button
+  const connectRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("open_connect_modal")
+      .setLabel("Connect Jellyfin")
+      .setEmoji("🔗")
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  const reply = await i.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR_BRAND)
+        .setTitle("🎬 Jellyfin → Stremio Setup")
+        .setDescription(
+          "Stream your Jellyfin library directly in Stremio.\n\n" +
+            "**How it works:**\n" +
+            "1. Connect your Jellyfin server\n" +
+            "2. Choose which libraries to expose\n" +
+            "3. Paste the generated URL into Stremio\n\n" +
+            "Click below to get started."
+        ),
+    ],
+    components: [connectRow],
+    ephemeral: true,
+    fetchReply: true,
+  });
+
+  let connectBtn: ButtonInteraction;
+  try {
+    connectBtn = (await reply.awaitMessageComponent({
+      componentType: ComponentType.Button,
+      time: 120_000,
+    })) as ButtonInteraction;
+  } catch {
+    await i.editReply({ embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("⏱️ Timed out.")], components: [] });
+    return;
+  }
+
+  // Show modal for credentials
+  const modal = new ModalBuilder()
+    .setCustomId("jellyfin_connect_modal")
+    .setTitle("Connect to Jellyfin")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("server_url")
+          .setLabel("Server URL")
+          .setPlaceholder("https://jellyfin.example.com")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("username")
+          .setLabel("Username")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("password")
+          .setLabel("Password")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      )
+    );
+
+  await connectBtn.showModal(modal);
+
+  let modalSubmit: ModalSubmitInteraction;
+  try {
+    modalSubmit = await connectBtn.awaitModalSubmit({ time: 120_000 });
+  } catch {
+    await i.editReply({ embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("⏱️ Timed out.")], components: [] });
+    return;
+  }
+
+  await modalSubmit.deferReply({ ephemeral: true });
+
+  const serverUrl = modalSubmit.fields.getTextInputValue("server_url").replace(/\/$/, "");
+  const username = modalSubmit.fields.getTextInputValue("username");
+  const password = modalSubmit.fields.getTextInputValue("password");
 
   try {
     const auth = await jellyfinAuth(serverUrl, username, password);
@@ -49,274 +406,105 @@ async function handleConnect(i: ChatInputCommandInteraction): Promise<void> {
       allLibraries: libraries,
     });
 
-    const libList = libraries.map((l) => `• **${l.name}** (${l.collectionType})`).join("\n");
-
-    await i.editReply({
+    await modalSubmit.editReply({
       embeds: [
-        successEmbed(
-          "✅ Connected to Jellyfin",
-          `Logged in as **${auth.username}** on \`${serverUrl}\`\n\n` +
-            `**Libraries found (${libraries.length}):**\n${libList || "No supported libraries"}\n\n` +
-            `All libraries are enabled by default. Use \`/jellyfin libraries\` to choose which ones to include.`
-        ),
+        new EmbedBuilder()
+          .setColor(COLOR_SUCCESS)
+          .setDescription(`✅ Connected as **${auth.username}** — loading libraries…`),
       ],
     });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : "Unknown error";
-    await i.editReply({ embeds: [errorEmbed(`Connection failed: ${msg}`)] });
-  }
-}
 
-async function handleLibraries(i: ChatInputCommandInteraction): Promise<void> {
-  const session = getSession(i.user.id);
-  if (!session) {
-    await i.reply({
-      embeds: [errorEmbed("You are not connected. Use `/jellyfin connect` first.")],
-      ephemeral: true,
+    // Delete the deferReply message then hand off to library step via a fresh interaction
+    // We need to send a new followUp-style message for the library step since deferReply is already consumed
+    const libEnableIds = new Set(libraries.map((l) => l.id));
+    const options = libraries.map((lib) =>
+      new StringSelectMenuOptionBuilder()
+        .setLabel(lib.name)
+        .setValue(lib.id)
+        .setDescription(lib.collectionType === "movies" ? "Movies" : "TV Shows")
+        .setEmoji(lib.collectionType === "movies" ? "🎬" : "📺")
+        .setDefault(libEnableIds.has(lib.id))
+    );
+
+    if (options.length === 0) {
+      await modalSubmit.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(COLOR_NEUTRAL)
+            .setTitle("No Supported Libraries")
+            .setDescription("No movie or TV show libraries found on your Jellyfin server."),
+        ],
+      });
+      return;
+    }
+
+    const select = new StringSelectMenuBuilder()
+      .setCustomId("lib_select_post_connect")
+      .setPlaceholder("Pick libraries to include in Stremio…")
+      .setMinValues(0)
+      .setMaxValues(libraries.length)
+      .addOptions(options);
+
+    const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+
+    const libMsg = await modalSubmit.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR_BRAND)
+          .setTitle("📚 Step 2 — Select Libraries")
+          .setDescription(
+            `Choose which libraries to expose in Stremio.\nAll ${libraries.length} supported ${libraries.length === 1 ? "library is" : "libraries are"} pre-selected.`
+          ),
+      ],
+      components: [row],
     });
-    return;
-  }
 
-  if (session.allLibraries.length === 0) {
-    await i.reply({
-      embeds: [errorEmbed("No supported libraries found on your Jellyfin server.")],
-      ephemeral: true,
-    });
-    return;
-  }
-
-  const enabledIds = new Set(session.enabledLibraries.map((l) => l.id));
-
-  const options = session.allLibraries.map((lib) =>
-    new StringSelectMenuOptionBuilder()
-      .setLabel(lib.name)
-      .setValue(lib.id)
-      .setDescription(lib.collectionType === "movies" ? "Movies" : "TV Shows")
-      .setEmoji(lib.collectionType === "movies" ? "🎬" : "📺")
-      .setDefault(enabledIds.has(lib.id))
-  );
-
-  const select = new StringSelectMenuBuilder()
-    .setCustomId("library_select")
-    .setPlaceholder("Select libraries to include in Stremio")
-    .setMinValues(0)
-    .setMaxValues(session.allLibraries.length)
-    .addOptions(options);
-
-  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
-
-  const reply = await i.reply({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0x3498db)
-        .setTitle("📚 Select Libraries")
-        .setDescription(
-          "Choose which Jellyfin libraries to expose in Stremio. Currently enabled are pre-selected."
-        ),
-    ],
-    components: [row],
-    ephemeral: true,
-  });
-
-  try {
-    const selection = (await reply.awaitMessageComponent({
+    const sel = (await libMsg.awaitMessageComponent({
       componentType: ComponentType.StringSelect,
-      time: 60_000,
+      time: 120_000,
     })) as StringSelectMenuInteraction;
 
-    const chosen: Library[] = session.allLibraries.filter((l) =>
-      selection.values.includes(l.id)
-    );
+    const chosen: Library[] = libraries.filter((l) => sel.values.includes(l.id));
     updateEnabledLibraries(i.user.id, chosen);
 
-    const names =
-      chosen.length > 0 ? chosen.map((l) => `• **${l.name}**`).join("\n") : "_None selected_";
+    if (chosen.length === 0) {
+      await sel.update({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(COLOR_NEUTRAL)
+            .setDescription("No libraries selected. Run `/jellyfin` and use **Manage Libraries** to enable some."),
+        ],
+        components: [],
+      });
+      return;
+    }
 
-    await selection.update({
-      embeds: [
-        successEmbed(
-          "✅ Libraries Updated",
-          `Enabled libraries:\n${names}\n\nRun \`/jellyfin manifest\` to get your updated Stremio URL.`
-        ),
-      ],
-      components: [],
-    });
-  } catch {
-    await i.editReply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x95a5a6)
-          .setDescription("⏱️ Selection timed out. No changes made."),
-      ],
-      components: [],
-    });
-  }
-}
-
-async function handleManifest(i: ChatInputCommandInteraction): Promise<void> {
-  const session = getSession(i.user.id);
-  if (!session) {
-    await i.reply({
-      embeds: [errorEmbed("You are not connected. Use `/jellyfin connect` first.")],
-      ephemeral: true,
-    });
-    return;
-  }
-
-  if (session.enabledLibraries.length === 0) {
-    await i.reply({
-      embeds: [
-        errorEmbed(
-          "No libraries are enabled. Use `/jellyfin libraries` to select at least one library."
-        ),
-      ],
-      ephemeral: true,
-    });
-    return;
-  }
-
-  try {
+    const finalSession = getSession(i.user.id)!;
     const url = getManifestUrl({
-      serverUrl: session.serverUrl,
-      userId: session.userId,
-      accessToken: session.accessToken,
-      enabledLibraries: session.enabledLibraries,
+      serverUrl: finalSession.serverUrl,
+      userId: finalSession.userId,
+      accessToken: finalSession.accessToken,
+      enabledLibraries: chosen,
     });
 
-    const libNames = session.enabledLibraries.map((l) => `• ${l.name}`).join("\n");
+    const libNames = chosen.map((l) => `${l.collectionType === "movies" ? "🎬" : "📺"} ${l.name}`).join("\n");
 
-    await i.reply({
+    await sel.update({
       embeds: [
         new EmbedBuilder()
-          .setColor(0x9b59b6)
-          .setTitle("🎬 Your Stremio Manifest URL")
+          .setColor(COLOR_SUCCESS)
+          .setTitle("✅ Step 3 — Your Stremio Manifest URL")
           .setDescription(
-            `**Copy this URL and paste it into Stremio:**\n\`\`\`\n${url}\n\`\`\`\n` +
-              `**Included libraries:**\n${libNames}\n\n` +
-              `In Stremio: go to **Addons → Community Addons → Install from URL** and paste the URL above.`
+            `**Paste this into Stremio:**\n\`\`\`\n${url}\n\`\`\`\n` +
+              `**Libraries included:**\n${libNames}\n\n` +
+              `In Stremio: **Addons → Community Addons → Install from URL**`
           )
           .setFooter({ text: "Keep this URL private — it contains your Jellyfin access token." }),
       ],
-      ephemeral: true,
+      components: [],
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
-    await i.reply({ embeds: [errorEmbed(msg)], ephemeral: true });
-  }
-}
-
-async function handleStatus(i: ChatInputCommandInteraction): Promise<void> {
-  const session = getSession(i.user.id);
-  if (!session) {
-    await i.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x95a5a6)
-          .setDescription("Not connected. Use `/jellyfin connect` to get started."),
-      ],
-      ephemeral: true,
-    });
-    return;
-  }
-
-  const enabled =
-    session.enabledLibraries.length > 0
-      ? session.enabledLibraries.map((l) => `• ${l.name}`).join("\n")
-      : "_None selected_";
-
-  await i.reply({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0x2ecc71)
-        .setTitle("📡 Jellyfin Status")
-        .addFields(
-          { name: "Server", value: `\`${session.serverUrl}\``, inline: false },
-          { name: "Username", value: session.username, inline: true },
-          {
-            name: "Libraries",
-            value: `${session.allLibraries.length} total`,
-            inline: true,
-          },
-          { name: "Enabled in Stremio", value: enabled, inline: false }
-        ),
-    ],
-    ephemeral: true,
-  });
-}
-
-async function handleDisconnect(i: ChatInputCommandInteraction): Promise<void> {
-  const deleted = deleteSession(i.user.id);
-  if (deleted) {
-    await i.reply({
-      embeds: [successEmbed("✅ Disconnected", "Your Jellyfin session has been cleared.")],
-      ephemeral: true,
-    });
-  } else {
-    await i.reply({
-      embeds: [new EmbedBuilder().setColor(0x95a5a6).setDescription("You were not connected.")],
-      ephemeral: true,
-    });
-  }
-}
-
-export const commandDefinitions = [
-  new SlashCommandBuilder()
-    .setName("jellyfin")
-    .setDescription("Jellyfin Stremio Addon commands")
-    .addSubcommand((sub) =>
-      sub
-        .setName("connect")
-        .setDescription("Connect your Jellyfin server")
-        .addStringOption((o) =>
-          o
-            .setName("server_url")
-            .setDescription("Your Jellyfin server URL (e.g. https://jellyfin.example.com)")
-            .setRequired(true)
-        )
-        .addStringOption((o) =>
-          o.setName("username").setDescription("Your Jellyfin username").setRequired(true)
-        )
-        .addStringOption((o) =>
-          o.setName("password").setDescription("Your Jellyfin password").setRequired(true)
-        )
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName("libraries")
-        .setDescription("Choose which Jellyfin libraries to include in Stremio")
-    )
-    .addSubcommand((sub) =>
-      sub.setName("manifest").setDescription("Get your Stremio manifest URL")
-    )
-    .addSubcommand((sub) =>
-      sub.setName("status").setDescription("Show your current Jellyfin connection status")
-    )
-    .addSubcommand((sub) =>
-      sub.setName("disconnect").setDescription("Clear your Jellyfin session")
-    ),
-];
-
-export async function handleCommand(i: ChatInputCommandInteraction): Promise<void> {
-  if (i.commandName !== "jellyfin") return;
-
-  const sub = i.options.getSubcommand();
-  switch (sub) {
-    case "connect":
-      await handleConnect(i);
-      break;
-    case "libraries":
-      await handleLibraries(i);
-      break;
-    case "manifest":
-      await handleManifest(i);
-      break;
-    case "status":
-      await handleStatus(i);
-      break;
-    case "disconnect":
-      await handleDisconnect(i);
-      break;
-    default:
-      await i.reply({ content: "Unknown subcommand.", ephemeral: true });
+    await modalSubmit.editReply({ embeds: [errorEmbed(`Connection failed: ${msg}`)], components: [] });
   }
 }
