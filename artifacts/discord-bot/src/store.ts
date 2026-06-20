@@ -11,6 +11,7 @@ export interface UserSession {
   username: string;
   enabledLibraries: Library[];
   allLibraries: Library[];
+  maxStreams: number; // 0 = unlimited
 }
 
 const sessions = new Map<string, UserSession>();

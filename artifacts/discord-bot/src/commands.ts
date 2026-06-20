@@ -148,6 +148,7 @@ async function showManifestStep(
       userId: session.userId,
       accessToken: session.accessToken,
       enabledLibraries: session.enabledLibraries,
+      maxStreams: session.maxStreams,
     });
   } catch (err) {
     await i.update({
@@ -246,6 +247,7 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
           .addFields(
             { name: "Server", value: `\`${session.serverUrl}\``, inline: false },
             { name: "Username", value: session.username, inline: true },
+            { name: "Max Streams", value: session.maxStreams === 0 ? "Unlimited" : `${session.maxStreams}`, inline: true },
             { name: "Enabled Libraries", value: libNames, inline: false }
           ),
       ],
@@ -273,6 +275,7 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
               userId: session.userId,
               accessToken: session.accessToken,
               enabledLibraries: session.enabledLibraries,
+              maxStreams: session.maxStreams,
             });
           } catch (err) {
             await btn.update({
@@ -374,6 +377,14 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
           .setLabel("Password")
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("max_streams")
+          .setLabel("Max Concurrent Streams (0 = unlimited)")
+          .setPlaceholder("0")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
       )
     );
 
@@ -392,6 +403,8 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
   const serverUrl = modalSubmit.fields.getTextInputValue("server_url").replace(/\/$/, "");
   const username = modalSubmit.fields.getTextInputValue("username");
   const password = modalSubmit.fields.getTextInputValue("password");
+  const maxStreamsRaw = modalSubmit.fields.getTextInputValue("max_streams").trim();
+  const maxStreams = maxStreamsRaw === "" ? 0 : Math.max(0, parseInt(maxStreamsRaw, 10) || 0);
 
   try {
     const auth = await jellyfinAuth(serverUrl, username, password);
@@ -404,6 +417,7 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
       username: auth.username,
       enabledLibraries: libraries,
       allLibraries: libraries,
+      maxStreams,
     });
 
     await modalSubmit.editReply({
@@ -485,6 +499,7 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
       userId: finalSession.userId,
       accessToken: finalSession.accessToken,
       enabledLibraries: chosen,
+      maxStreams: finalSession.maxStreams,
     });
 
     const libNames = chosen.map((l) => `${l.collectionType === "movies" ? "🎬" : "📺"} ${l.name}`).join("\n");

@@ -54,6 +54,7 @@ export function encodeConfig(config: {
   userId: string;
   accessToken: string;
   enabledLibraries: Library[];
+  maxStreams?: number;
 }): string {
   return Buffer.from(JSON.stringify(config)).toString("base64url");
 }
@@ -63,6 +64,7 @@ export function getManifestUrl(config: {
   userId: string;
   accessToken: string;
   enabledLibraries: Library[];
+  maxStreams?: number;
 }): string {
   const domain = process.env["REPLIT_DOMAINS"]?.split(",")[0];
   if (!domain) throw new Error("REPLIT_DOMAINS not set");
