@@ -22,7 +22,7 @@ import {
   updateEnabledLibraries,
   type Library,
 } from "./store.js";
-import { jellyfinAuth, jellyfinLibraries, getManifestUrl, createJellyfinUser } from "./api.js";
+import { jellyfinAuth, jellyfinLibraries, getManifestUrl, createJellyfinUser, getActiveSessions, terminateSession } from "./api.js";
 
 const COLOR_BRAND = 0x00a4dc; // Jellyfin blue
 const COLOR_SUCCESS = 0x2ecc71;
@@ -330,6 +330,182 @@ async function handleAddUser(i: ChatInputCommandInteraction): Promise<void> {
   }
 }
 
+function typeEmoji(type: string | null): string {
+  if (type === "Movie") return "🎬";
+  if (type === "Episode") return "📺";
+  return "▶️";
+}
+
+async function handleStreams(i: ChatInputCommandInteraction): Promise<void> {
+  const session = getSession(i.user.id);
+
+  // If already connected, skip straight to fetching sessions
+  if (session) {
+    await showStreams(i, session.serverUrl, session.accessToken, false);
+    return;
+  }
+
+  // Not connected — ask for admin credentials via modal
+  const openRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("open_streams_modal")
+      .setLabel("View Active Streams")
+      .setEmoji("📡")
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  const reply = await i.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR_BRAND)
+        .setTitle("📡 Active Streams")
+        .setDescription("You're not connected yet. Enter your Jellyfin credentials to view active streams."),
+    ],
+    components: [openRow],
+    ephemeral: true,
+    fetchReply: true,
+  });
+
+  let btn: ButtonInteraction;
+  try {
+    btn = (await reply.awaitMessageComponent({ componentType: ComponentType.Button, time: 120_000 })) as ButtonInteraction;
+  } catch {
+    await i.editReply({ embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("⏱️ Timed out.")], components: [] });
+    return;
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId("streams_modal")
+    .setTitle("Jellyfin — View Streams")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("server_url").setLabel("Server URL").setPlaceholder("https://jellyfin.example.com").setStyle(TextInputStyle.Short).setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("username").setLabel("Username (admin recommended)").setStyle(TextInputStyle.Short).setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("password").setLabel("Password").setStyle(TextInputStyle.Short).setRequired(true)
+      )
+    );
+
+  await btn.showModal(modal);
+
+  let modalSubmit: ModalSubmitInteraction;
+  try {
+    modalSubmit = await btn.awaitModalSubmit({ time: 120_000 });
+  } catch {
+    await i.editReply({ embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("⏱️ Timed out.")], components: [] });
+    return;
+  }
+
+  await modalSubmit.deferReply({ ephemeral: true });
+
+  const serverUrl = modalSubmit.fields.getTextInputValue("server_url").replace(/\/$/, "");
+  const username = modalSubmit.fields.getTextInputValue("username");
+  const password = modalSubmit.fields.getTextInputValue("password");
+
+  try {
+    const auth = await jellyfinAuth(serverUrl, username, password);
+    await showStreams(modalSubmit, auth.serverUrl, auth.accessToken, true);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    await modalSubmit.editReply({ embeds: [errorEmbed(`Auth failed: ${msg}`)] });
+  }
+}
+
+async function showStreams(
+  i: ChatInputCommandInteraction | ModalSubmitInteraction,
+  serverUrl: string,
+  accessToken: string,
+  deferred: boolean
+): Promise<void> {
+  if (!deferred) await i.deferReply({ ephemeral: true });
+
+  let sessions;
+  try {
+    sessions = await getActiveSessions(serverUrl, accessToken);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    await i.editReply({ embeds: [errorEmbed(`Could not fetch sessions: ${msg}`)] });
+    return;
+  }
+
+  if (sessions.length === 0) {
+    await i.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR_NEUTRAL)
+          .setTitle("📡 Active Streams")
+          .setDescription("No active streams right now."),
+      ],
+    });
+    return;
+  }
+
+  const lines = sessions.map((s, idx) =>
+    `**${idx + 1}.** ${typeEmoji(s.nowPlayingType)} **${s.nowPlayingTitle ?? "Unknown"}**\n` +
+    `┗ 👤 ${s.userName} · 📱 ${s.client} (${s.deviceName})${s.isPaused ? " · ⏸ Paused" : ""}`
+  );
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR_BRAND)
+    .setTitle(`📡 Active Streams — ${sessions.length} playing`)
+    .setDescription(lines.join("\n\n"))
+    .setFooter({ text: `Server: ${serverUrl}` });
+
+  // Build terminate select only if there are streams to kill
+  const selectOptions = sessions.map((s, idx) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(`Stop: ${s.userName} — ${s.nowPlayingTitle?.slice(0, 50) ?? "Unknown"}`)
+      .setValue(s.id)
+      .setDescription(`${s.client} · ${s.deviceName}`)
+      .setEmoji(idx % 2 === 0 ? "🛑" : "🔴")
+  );
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId("terminate_stream_select")
+    .setPlaceholder("Select a stream to stop…")
+    .setMinValues(1)
+    .setMaxValues(sessions.length)
+    .addOptions(selectOptions);
+
+  const refreshRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("refresh_streams").setLabel("Refresh").setEmoji("🔄").setStyle(ButtonStyle.Secondary)
+  );
+  const selectRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+
+  const msg = await i.editReply({ embeds: [embed], components: [selectRow, refreshRow] });
+
+  try {
+    const action = await msg.awaitMessageComponent({ time: 120_000 });
+
+    if (action.customId === "refresh_streams") {
+      await (action as ButtonInteraction).deferUpdate();
+      await showStreams(i, serverUrl, accessToken, true);
+    } else {
+      const sel = action as StringSelectMenuInteraction;
+      await sel.deferUpdate();
+
+      const results = await Promise.allSettled(
+        sel.values.map((id) => terminateSession(serverUrl, accessToken, id))
+      );
+
+      const stopped = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.filter((r) => r.status === "rejected").length;
+
+      const lines: string[] = [];
+      if (stopped > 0) lines.push(`✅ Stopped **${stopped}** stream${stopped !== 1 ? "s" : ""}`);
+      if (failed > 0) lines.push(`❌ Failed to stop **${failed}** stream${failed !== 1 ? "s" : ""}`);
+
+      await i.editReply({
+        embeds: [new EmbedBuilder().setColor(stopped > 0 ? COLOR_SUCCESS : COLOR_ERROR).setDescription(lines.join("\n"))],
+        components: [],
+      });
+    }
+  } catch { /* timed out */ }
+}
+
 export const commandDefinitions = [
   new SlashCommandBuilder()
     .setName("jellyfin")
@@ -337,11 +513,18 @@ export const commandDefinitions = [
   new SlashCommandBuilder()
     .setName("jellyfin-adduser")
     .setDescription("Create a new user account on your Jellyfin server"),
+  new SlashCommandBuilder()
+    .setName("jellyfin-streams")
+    .setDescription("View and manage active streams on your Jellyfin server"),
 ];
 
 export async function handleCommand(i: ChatInputCommandInteraction): Promise<void> {
   if (i.commandName === "jellyfin-adduser") {
     await handleAddUser(i);
+    return;
+  }
+  if (i.commandName === "jellyfin-streams") {
+    await handleStreams(i);
     return;
   }
   if (i.commandName !== "jellyfin") return;

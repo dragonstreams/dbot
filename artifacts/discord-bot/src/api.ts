@@ -52,6 +52,72 @@ export async function jellyfinLibraries(
 const EMBY_AUTH = (token: string) =>
   `MediaBrowser Client="Stremio Jellyfin Addon", Device="Discord Bot", DeviceId="discord-bot", Version="1.0.0", Token="${token}"`;
 
+export interface ActiveSession {
+  id: string;
+  userName: string;
+  client: string;
+  deviceName: string;
+  nowPlayingTitle: string | null;
+  nowPlayingType: string | null;
+  isPaused: boolean;
+}
+
+export async function getActiveSessions(
+  serverUrl: string,
+  accessToken: string
+): Promise<ActiveSession[]> {
+  const res = await fetch(`${serverUrl}/Sessions?ActiveWithinSeconds=300`, {
+    headers: {
+      "X-Emby-Authorization": EMBY_AUTH(accessToken),
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { Message?: string };
+    throw new Error(body.Message ?? `Failed to fetch sessions (${res.status})`);
+  }
+
+  const sessions = (await res.json()) as Array<{
+    Id: string;
+    UserName?: string;
+    Client?: string;
+    DeviceName?: string;
+    NowPlayingItem?: { Name?: string; Type?: string; SeriesName?: string };
+    PlayState?: { IsPaused?: boolean };
+  }>;
+
+  return sessions
+    .filter((s) => s.NowPlayingItem != null)
+    .map((s) => ({
+      id: s.Id,
+      userName: s.UserName ?? "Unknown",
+      client: s.Client ?? "Unknown",
+      deviceName: s.DeviceName ?? "Unknown",
+      nowPlayingTitle:
+        s.NowPlayingItem?.SeriesName
+          ? `${s.NowPlayingItem.SeriesName} — ${s.NowPlayingItem.Name ?? ""}`
+          : (s.NowPlayingItem?.Name ?? null),
+      nowPlayingType: s.NowPlayingItem?.Type ?? null,
+      isPaused: s.PlayState?.IsPaused ?? false,
+    }));
+}
+
+export async function terminateSession(
+  serverUrl: string,
+  accessToken: string,
+  sessionId: string
+): Promise<void> {
+  const res = await fetch(`${serverUrl}/Sessions/${sessionId}/Playing/Stop`, {
+    method: "POST",
+    headers: { "X-Emby-Authorization": EMBY_AUTH(accessToken) },
+  });
+  // Jellyfin returns 204 on success; some versions return 200 or 404 for idle sessions
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`Could not terminate session (${res.status})`);
+  }
+}
+
 export interface CreateUserResult {
   userId: string;
   username: string;
