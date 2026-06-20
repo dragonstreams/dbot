@@ -49,6 +49,54 @@ export async function jellyfinLibraries(
   return data.libraries;
 }
 
+const EMBY_AUTH = (token: string) =>
+  `MediaBrowser Client="Stremio Jellyfin Addon", Device="Discord Bot", DeviceId="discord-bot", Version="1.0.0", Token="${token}"`;
+
+export interface CreateUserResult {
+  userId: string;
+  username: string;
+}
+
+export async function createJellyfinUser(
+  serverUrl: string,
+  adminToken: string,
+  newUsername: string,
+  newPassword: string
+): Promise<CreateUserResult> {
+  // Step 1 — create the account
+  const createRes = await fetch(`${serverUrl}/Users/New`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Emby-Authorization": EMBY_AUTH(adminToken),
+    },
+    body: JSON.stringify({ Name: newUsername }),
+  });
+
+  if (!createRes.ok) {
+    const body = (await createRes.json().catch(() => ({}))) as { Message?: string };
+    throw new Error(body.Message ?? `User creation failed (${createRes.status})`);
+  }
+
+  const created = (await createRes.json()) as { Id: string; Name: string };
+
+  // Step 2 — set the password
+  const pwRes = await fetch(`${serverUrl}/Users/${created.Id}/Password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Emby-Authorization": EMBY_AUTH(adminToken),
+    },
+    body: JSON.stringify({ NewPw: newPassword, ResetPassword: false }),
+  });
+
+  if (!pwRes.ok) {
+    throw new Error(`User created but password could not be set (${pwRes.status})`);
+  }
+
+  return { userId: created.Id, username: created.Name };
+}
+
 export function encodeConfig(config: {
   serverUrl: string;
   userId: string;

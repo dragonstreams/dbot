@@ -22,7 +22,7 @@ import {
   updateEnabledLibraries,
   type Library,
 } from "./store.js";
-import { jellyfinAuth, jellyfinLibraries, getManifestUrl } from "./api.js";
+import { jellyfinAuth, jellyfinLibraries, getManifestUrl, createJellyfinUser } from "./api.js";
 
 const COLOR_BRAND = 0x00a4dc; // Jellyfin blue
 const COLOR_SUCCESS = 0x2ecc71;
@@ -206,13 +206,144 @@ async function showManifestStep(
   } catch { /* timed out */ }
 }
 
+async function handleAddUser(i: ChatInputCommandInteraction): Promise<void> {
+  // If the user already has a connected session, pre-fill server URL from it
+  const session = getSession(i.user.id);
+
+  const openRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("open_adduser_modal")
+      .setLabel("Create Jellyfin User")
+      .setEmoji("👤")
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  const reply = await i.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR_BRAND)
+        .setTitle("👤 Create a New Jellyfin User")
+        .setDescription(
+          "Creates a new account on your Jellyfin server.\n\n" +
+            "**Requirements:** You must provide admin credentials.\n" +
+            (session ? `Your connected server is \`${session.serverUrl}\` — you can use the same URL below.` : "")
+        ),
+    ],
+    components: [openRow],
+    ephemeral: true,
+    fetchReply: true,
+  });
+
+  let btn: ButtonInteraction;
+  try {
+    btn = (await reply.awaitMessageComponent({
+      componentType: ComponentType.Button,
+      time: 120_000,
+    })) as ButtonInteraction;
+  } catch {
+    await i.editReply({ embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("⏱️ Timed out.")], components: [] });
+    return;
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId("adduser_modal")
+    .setTitle("Create Jellyfin User")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("server_url")
+          .setLabel("Server URL")
+          .setPlaceholder(session?.serverUrl ?? "https://jellyfin.example.com")
+          .setValue(session?.serverUrl ?? "")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("admin_username")
+          .setLabel("Admin Username")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("admin_password")
+          .setLabel("Admin Password")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("new_username")
+          .setLabel("New Username")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("new_password")
+          .setLabel("New User Password")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      )
+    );
+
+  await btn.showModal(modal);
+
+  let modalSubmit: ModalSubmitInteraction;
+  try {
+    modalSubmit = await btn.awaitModalSubmit({ time: 120_000 });
+  } catch {
+    await i.editReply({ embeds: [new EmbedBuilder().setColor(COLOR_NEUTRAL).setDescription("⏱️ Timed out.")], components: [] });
+    return;
+  }
+
+  await modalSubmit.deferReply({ ephemeral: true });
+
+  const serverUrl = modalSubmit.fields.getTextInputValue("server_url").replace(/\/$/, "");
+  const adminUsername = modalSubmit.fields.getTextInputValue("admin_username");
+  const adminPassword = modalSubmit.fields.getTextInputValue("admin_password");
+  const newUsername = modalSubmit.fields.getTextInputValue("new_username");
+  const newPassword = modalSubmit.fields.getTextInputValue("new_password");
+
+  try {
+    // Authenticate admin first to get their token
+    const auth = await jellyfinAuth(serverUrl, adminUsername, adminPassword);
+    // Create the new user
+    const result = await createJellyfinUser(serverUrl, auth.accessToken, newUsername, newPassword);
+
+    await modalSubmit.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR_SUCCESS)
+          .setTitle("✅ User Created")
+          .addFields(
+            { name: "Username", value: result.username, inline: true },
+            { name: "Server", value: `\`${serverUrl}\``, inline: false }
+          )
+          .setDescription("The account is ready. Share the username and password with the new user."),
+      ],
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    await modalSubmit.editReply({ embeds: [errorEmbed(`Failed: ${msg}`)] });
+  }
+}
+
 export const commandDefinitions = [
   new SlashCommandBuilder()
     .setName("jellyfin")
     .setDescription("Set up your Jellyfin Stremio addon"),
+  new SlashCommandBuilder()
+    .setName("jellyfin-adduser")
+    .setDescription("Create a new user account on your Jellyfin server"),
 ];
 
 export async function handleCommand(i: ChatInputCommandInteraction): Promise<void> {
+  if (i.commandName === "jellyfin-adduser") {
+    await handleAddUser(i);
+    return;
+  }
   if (i.commandName !== "jellyfin") return;
 
   const session = getSession(i.user.id);
