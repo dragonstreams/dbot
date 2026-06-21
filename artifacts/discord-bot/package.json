@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx src/index.ts",
-    "register": "tsx src/register.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
-  },
+  "dev": "tsx src/index.ts",
+  "build": "tsc -p tsconfig.json",
+  "start": "node dist/index.js",
+  "register": "tsx src/register.ts",
+  "typecheck": "tsc -p tsconfig.json --noEmit"
+},
   "dependencies": {
     "discord.js": "^14.26.4"
   },
