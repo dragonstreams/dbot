@@ -1,0 +1,35 @@
+# .dockerignore for dbot multi-arch build
+# Only exclude things that bloat the context but are not needed
+
+# VCS and IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Docs and large non-essential files
+*.md
+LICENSE*
+CHANGELOG*
+docs/
+
+# Local env and caches
+.env*
+.env.local
+node_modules/
+npm-debug.log*
+
+# Test data, videos, large downloads, ISOs etc. (heavy and unused in image build)
+Downloads/
+test/
+*.iso
+*.zip
+*.tar.gz
+*.mp4
+*.mkv
+*.7z
+*.deb
+
+# Local build outputs that are regenerated
+dist/
+build/
