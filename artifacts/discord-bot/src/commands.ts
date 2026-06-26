@@ -22,7 +22,7 @@ import {
   updateEnabledLibraries,
   type Library,
 } from "./store.js";
-import { jellyfinAuth, jellyfinLibraries, getManifestUrl, createJellyfinUser, getActiveSessions, terminateSession } from "./api.js";
+import { jellyfinAuth, jellyfinLibraries, getManifestUrl, createJellyfinUser, getActiveSessions, terminateSession, mediaAuthenticate, getMediaUserData, findMatchingMediaItem, updateMediaUserData, type MediaItem } from "./api.js";
 
 const COLOR_BRAND = 0x00a4dc; // Jellyfin blue
 const COLOR_SUCCESS = 0x2ecc71;
@@ -424,7 +424,7 @@ async function showStreams(
 
   let sessions;
   try {
-    sessions = await getActiveSessions(serverUrl, accessToken);
+    sessions = await getActiveSessions(serverUrl, authToken: string
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
     await i.editReply({ embeds: [errorEmbed(`Could not fetch sessions: ${msg}`)] });
@@ -460,7 +460,7 @@ async function showStreams(
       .setLabel(`Stop: ${s.userName} — ${s.nowPlayingTitle?.slice(0, 50) ?? "Unknown"}`)
       .setValue(s.id)
       .setDescription(`${s.client} · ${s.deviceName}`)
-      .setEmoji(idx % 2 === 0 ? "🛑" : "🔴")
+      .setEmoji(idx % 2 === 0 ? "🛁" : "🔴")
   );
 
   const select = new StringSelectMenuBuilder()
@@ -516,6 +516,9 @@ export const commandDefinitions = [
   new SlashCommandBuilder()
     .setName("jellyfin-streams")
     .setDescription("View and manage active streams on your Jellyfin server"),
+  new SlashCommandBuilder()
+    .setName("transfer")
+    .setDescription("Transfer watch history and favorites between Emby or Jellyfin servers (supports audiobooks)"),
 ];
 
 export async function handleCommand(i: ChatInputCommandInteraction): Promise<void> {
@@ -527,7 +530,11 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
     await handleStreams(i);
     return;
   }
-  if (i.commandName !== "jellyfin") return;
+  if (i.commandName === "transfer") {
+    await handleMediaTransfer(i);
+    return;
+  }
+  if (i.commandName !== "jellyfin" return;
 
   const session = getSession(i.user.id);
 
@@ -836,4 +843,167 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
     const msg = err instanceof Error ? err.message : "Unknown error";
     await modalSubmit.editReply({ embeds: [errorEmbed(`Connection failed: ${msg}`)], components: [] });
   }
+}
+
+// Emby Transfer - clean implementation
+
+interface PendingEmbyTransfer {
+  source?: { serverUrl: string; username: string; password: string };
+  target?: { serverUrl: string; username: string; password: string };
+}
+
+const pendingEmbyTransfers = new Map<string, PendingEmbyTransfer>();
+
+async function handleMediaTransfer(i: ChatInputCommandInteraction): Promise<void> {
+  const discordUserId = i.user.id;
+  pendingEmbyTransfers.set(discordUserId, {});
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("media_source_modal").setLabel("Source Server Credentials").setEmoji("⬅️").
+    new ButtonBuilder().setCustomId("media_target_modal").setLabel("Target Server Credentials").setEmoji("➡️").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("media_start_transfer").setLabel("Start Transfer").setEmoji("🚀").setStyle(ButtonStyle.Success)
+  );
+
+  const reply = await i.reply({
+    embeds: [new EmbedBuilder().setColor(COLOR_BRAND).setTitle("🔄 Media Transfer (Emby/Jellyfin)").setDescription(
+      "Transfer watch history, resume positions, play counts and favorites between two Emby or Jellyfin servers (supports Movies, TV, and **Audiobooks**).\n\n" +
+      "1. Source credentials\n2. Target credentials\n3. Start Transfer\n\nCredentials are ephemeral only."
+    )],
+    components: [row],
+    ephemeral: true,
+    fetchReply: true
+  });
+
+  const collector = reply.createMessageComponentCollector({ componentType: ComponentType.Button, time: 300000 });
+
+  collector.on("collect", async (btn) => {
+    if (btn.user.id !== i.user.id) {
+      btn.reply({ content: "Not for you", ephemeral: true });
+      return;
+    }
+
+    if (btn.customId === "media_source_modal") {
+      const m = new ModalBuilder().setCustomId("media_source_submit").setTitle("Source Server (Emby/Jellyfin)")
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("url").setLabel("Server URL").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("user").setLabel("Username").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("pass").setLabel("Password").setStyle(TextInputStyle.Short).setRequired(true))
+        );
+      await btn.showModal(m);
+    } else if (btn.customId === "media_target_modal") {
+      const m = new ModalBuilder().setCustomId("media_target_submit").setTitle("Target Server (Emby/Jellyfin)")
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("url").setLabel("Server URL").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("user").setLabel("Username").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("pass").setLabel("Password").setStyle(TextInputStyle.Short).setRequired(true))
+        );
+      await btn.showModal(m);
+    } else if (btn.customId === "media_start_transfer") {
+      await performMediaTransfer(btn);
+      collector.stop();
+    }
+  });
+}
+
+async function performMediaTransfer(i: ButtonInteraction) {
+  const id = i.user.id;
+  const p = pendingEmbyTransfers.get(id);
+  if (!p?.source || !p?.target) {
+    await i.reply({ embeds: [errorEmbed("Missing credentials")], ephemeral: true });
+    return;
+  }
+  await i.deferReply({ ephemeral: true });
+
+  try {
+    const src = await mediaAuthenticate(p.source.serverUrl, p.source.username, p.source.password);
+    const tgt = await mediaAuthenticate(p.target.serverUrl, p.target.username, p.target.password);
+
+    const srcData = await getMediaUserData(src.serverUrl, src.accessToken, src.userId);
+    const tgtData = await getMediaUserData(tgt.serverUrl, tgt.accessToken, tgt.userId);
+    const tgtItems = [...tgtData.watched, ...tgtData.favorites];
+
+    const toDo = [...srcData.watched, ...srcData.favorites];
+    const total = toDo.length;
+
+    let transferred = 0;
+    let matched = 0;
+    let notFound = 0;
+
+    const progressEmbed = (current: number, currName?: string) => {
+      const pct = total > 0 ? Math.floor((current / total) * 100) : 0;
+      const barLen = 20;
+      const filled = Math.floor((pct / 100) * barLen);
+      const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
+      return new EmbedBuilder()
+        .setColor(COLOR_BRAND)
+        .setTitle('🔄 Emby Transfer Progress')
+        .setDescription(
+          `**Progress:** \`${bar}\` ${pct}%\n` +
+          `**Items:** ${current}/${total}\n` +
+          `**Transferred:** ${transferred}  •  **Matched:** ${matched}  •  **Not found:** ${notFound}\n` +
+          (currName ? `**Current:** ${currName}` : '')
+        );
+    };
+
+    await i.editReply({ embeds: [progressEmbed(0)] });
+
+    for (let idx = 0; idx < toDo.length; idx++) {
+      const item = toDo[idx];
+      const match = findMatchingMediaItem(item, tgtItems);
+      if (!match) {
+        notFound++;
+      } else {
+        matched++;
+        const d: any = {};
+        if (item.UserData?.Played) {
+          d.Played = true;
+          d.PlayCount = item.UserData.PlayCount || 1;
+          d.LastPlayedDate = item.UserData.LastPlayedDate;
+          d.PlaybackPositionTicks = item.UserData.PlaybackPositionTicks || 0;
+        }
+        if (item.UserData?.IsFavorite) d.IsFavorite = true;
+        if (Object.keys(d).length) {
+          await updateMediaUserData(tgt.serverUrl, tgt.accessToken, tgt.userId, match.Id, d);
+          transferred++;
+        }
+      }
+
+      // Update progress every 5 items or at end
+      if ((idx + 1) % 5 === 0 || idx === toDo.length - 1) {
+        await i.editReply({ embeds: [progressEmbed(idx + 1, item.Name)] }).catch(() => {});
+      }
+    }
+
+    await i.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR_SUCCESS)
+          .setTitle('✅ Transfer Complete')
+          .setDescription(
+            `**Transferred:** ${transferred} items\n` +
+            `**Matched:** ${matched}\n` +
+            `**Not found on target:** ${notFound}\n\n` +
+            `From **${src.username}** on \`${p.source.serverUrl}\`\n` +
+            `To **${tgt.username}** on \`${p.target.serverUrl}\``
+          )
+      ]
+    });
+  } catch (e) {
+    await i.editReply({ embeds: [errorEmbed(String(e))] });
+  } finally {
+    pendingEmbyTransfers.delete(id);
+  }
+}
+
+export async function handleMediaModalSubmit(interaction: ModalSubmitInteraction) {
+  const id = interaction.user.id;
+  const p = pendingEmbyTransfers.get(id) || {};
+  if (interaction.customId === "media_source_submit") {
+    p.source = { serverUrl: interaction.fields.getTextInputValue("url").trim(), username: interaction.fields.getTextInputValue("user").trim(), password: interaction.fields.getTextInputValue("pass") };
+  }
+  if (interaction.customId === "media_target_submit") {
+    p.target = { serverUrl: interaction.fields.getTextInputValue("url").trim(), username: interaction.fields.getTextInputValue("user").trim(), password: interaction.fields.getTextInputValue("pass") };
+  }
+  pendingEmbyTransfers.set(id, p);
+  await interaction.reply({ embeds: [new EmbedBuilder().setDescription("✅ Saved. Go back to the original message and click **Start Transfer**. ")], ephemeral: true });
 }

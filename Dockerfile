@@ -5,6 +5,8 @@
 # Multi-arch supported (linux/amd64, linux/arm64+).
 # For bunny.net (amd64 only): use --platform linux/amd64
 #
+# Features: Emby watch history + favorites transfer (Movies, TV, Audiobooks) via /emby-transfer
+#
 # Build & push examples:
 #   # Single arch (e.g. for bunny.net)
 #   docker build --platform linux/amd64 -t ghcr.io/dragonstreams/dbot:latest .
@@ -59,8 +61,11 @@ RUN pnpm --filter @workspace/discord-bot run build
 # Create pruned production deployment (prod deps only)
 RUN pnpm --filter @workspace/discord-bot deploy --prod --legacy /prod/discord-bot
 
-# Copy compiled output into the deploy folder
-RUN cp -r /app/artifacts/discord-bot/dist /prod/discord-bot/dist
+# Ensure clean dist/ (prevent nesting from pre-deploy dist inclusion) + inject compiled JS
+RUN rm -rf /prod/discord-bot/dist && cp -r /app/artifacts/discord-bot/dist /prod/discord-bot/dist
+
+# Strip non-runtime files copied by deploy (no "files" field in package.json)
+RUN rm -rf /prod/discord-bot/src /prod/discord-bot/tsconfig* /prod/discord-bot/*.tsbuildinfo 2>/dev/null || true
 
 # ==========================================
 # Final minimal runtime image

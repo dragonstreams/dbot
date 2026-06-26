@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1.7
+#
+# Local Dockerfile for the Discord bot (transfer + jellyfin features)
+# Optimized for local builds (smaller context than full prod Dockerfile)
+#
+# Features: /transfer (Emby/Jellyfin history/favorites/audiobooks), /jellyfin commands
+#
+# Usage (from dbot/ root):
+#   docker build -f Dockerfile.bot -t local-dbot .
+#
+#   docker run --rm \
+#     -e DISCORD_TOKEN=xxx \
+#     -e DISCORD_CLIENT_ID=yyy \
+#     -e DISCORD_GUILD_ID=zzz \
+#     local-dbot
+#
+# With compose (recommended):
+#   docker compose -f docker-compose.yml up --build
+#
+# Multi-arch:
+#   docker buildx build -f Dockerfile.bot --platform linux/amd64,linux/arm64 -t local-dbot .
+
+FROM node:24-alpine AS base
+
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+RUN corepack enable
+
+# ==========================================
+# Builder: minimal workspace install + compile
+# ==========================================
+FROM base AS builder
+WORKDIR /app
+
+# Copy only manifests required for this package (pnpm workspace + catalog resolution)
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY artifacts/discord-bot/package.json ./artifacts/discord-bot/package.json
+
+RUN --mount=type=cache,target=/pnpm/store \
+    pnpm install --frozen-lockfile --ignore-scripts
+
+# Copy tsconfig (required by discord-bot/tsconfig) + bot source only
+COPY tsconfig.base.json ./
+COPY artifacts/discord-bot ./artifacts/discord-bot
+
+# Compile
+RUN pnpm --filter @workspace/discord-bot run build
+
+# Prune to production-only deployment (creates self-contained /prod with node_modules)
+RUN pnpm --filter @workspace/discord-bot deploy --prod --legacy /prod/discord-bot
+
+# Ensure clean dist/ (prevent nesting from pre-deploy dist inclusion) + inject compiled JS
+RUN rm -rf /prod/discord-bot/dist && cp -r /app/artifacts/discord-bot/dist /prod/discord-bot/dist
+
+# Strip non-runtime files copied by deploy (no "files" field in package.json)
+RUN rm -rf /prod/discord-bot/src /prod/discord-bot/tsconfig* /prod/discord-bot/*.tsbuildinfo 2>/dev/null || true
+
+# ==========================================
+# Final minimal runtime image
+# ==========================================
+FROM base AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY --from=builder /prod/discord-bot ./
+
+CMD ["node", "dist/index.js"]

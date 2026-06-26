@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  discord-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: emby-history-transfer-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}
+    # The bot does not need ports (it uses Discord gateway)

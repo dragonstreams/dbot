@@ -22,17 +22,31 @@ client.once(Events.ClientReady, (c) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  if (interaction.isChatInputCommand()) {
+    try {
+      await handleCommand(interaction as ChatInputCommandInteraction);
+    } catch (err) {
+      console.error("Error handling command:", err);
+      const msg = { content: "An error occurred while executing this command.", ephemeral: true };
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(msg).catch(console.error);
+      } else {
+        await interaction.reply(msg).catch(console.error);
+      }
+    }
+    return;
+  }
 
-  try {
-    await handleCommand(interaction as ChatInputCommandInteraction);
-  } catch (err) {
-    console.error("Error handling command:", err);
-    const msg = { content: "An error occurred while executing this command.", ephemeral: true };
-    if (interaction.deferred || interaction.replied) {
-      await interaction.followUp(msg).catch(console.error);
-    } else {
-      await interaction.reply(msg).catch(console.error);
+  // Handle media (Emby/Jellyfin) transfer modals
+  if (interaction.isModalSubmit() && (interaction.customId === "media_source_submit" || interaction.customId === "media_target_submit")) {
+    try {
+      const { handleMediaModalSubmit } = await import("./commands.js");
+      await handleMediaModalSubmit(interaction);
+    } catch (err) {
+      console.error("Media modal error:", err);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: "Failed to process modal.", ephemeral: true }).catch(() => {});
+      }
     }
   }
 });
