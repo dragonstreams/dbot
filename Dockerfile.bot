@@ -6,15 +6,18 @@
 # Features: /transfer (Emby/Jellyfin history/favorites/audiobooks), /jellyfin commands
 #
 # Usage (from dbot/ root):
-#   docker build -f Dockerfile.bot -t local-dbot .
+#   # Easiest: use the helper script (loads .env automatically)
+#   ./scripts/run.sh --build
 #
+#   # Or manually:
+#   docker build -f Dockerfile.bot -t local-dbot .
 #   docker run --rm \
 #     -e DISCORD_TOKEN=xxx \
 #     -e DISCORD_CLIENT_ID=yyy \
 #     -e DISCORD_GUILD_ID=zzz \
 #     local-dbot
 #
-# With compose (recommended):
+#   # With compose (recommended for development):
 #   docker compose -f docker-compose.yml up --build
 #
 # Multi-arch:
