@@ -424,7 +424,7 @@ async function showStreams(
 
   let sessions;
   try {
-    sessions = await getActiveSessions(serverUrl, authToken: string
+    sessions = await getActiveSessions(serverUrl, accessToken);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
     await i.editReply({ embeds: [errorEmbed(`Could not fetch sessions: ${msg}`)] });
@@ -460,7 +460,7 @@ async function showStreams(
       .setLabel(`Stop: ${s.userName} — ${s.nowPlayingTitle?.slice(0, 50) ?? "Unknown"}`)
       .setValue(s.id)
       .setDescription(`${s.client} · ${s.deviceName}`)
-      .setEmoji(idx % 2 === 0 ? "🛁" : "🔴")
+      .setEmoji(idx % 2 === 0 ? "🛑" : "🔴")
   );
 
   const select = new StringSelectMenuBuilder()
@@ -534,7 +534,7 @@ export async function handleCommand(i: ChatInputCommandInteraction): Promise<voi
     await handleMediaTransfer(i);
     return;
   }
-  if (i.commandName !== "jellyfin" return;
+  if (i.commandName !== "jellyfin") return;
 
   const session = getSession(i.user.id);
 
@@ -859,7 +859,7 @@ async function handleMediaTransfer(i: ChatInputCommandInteraction): Promise<void
   pendingEmbyTransfers.set(discordUserId, {});
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("media_source_modal").setLabel("Source Server Credentials").setEmoji("⬅️").
+    new ButtonBuilder().setCustomId("media_source_modal").setLabel("Source Server Credentials").setEmoji("⬅️").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("media_target_modal").setLabel("Target Server Credentials").setEmoji("➡️").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("media_start_transfer").setLabel("Start Transfer").setEmoji("🚀").setStyle(ButtonStyle.Success)
   );
